@@ -18,7 +18,7 @@
 - **断点续跑**：每仓库语言数据缓存 30 分钟（`--cache-ttl` 可调），中断后重跑不会从头再抓。抓结论为"这仓库没有代码"的空结果会单独负缓存 6 小时，所以那些空仓库不会每次都被重新请求。
 - **只改展示不动历史**：`--top` / `--theme` / `--output` 只影响出图，永远不会触发抓取；如果本轮 0 次 API 调用且仓库列表没变化，**不会新增 run 记录**，直接复用上一轮。
 - **`--reuse-missing`**：某仓库语言接口返回空（限流 / 瞬时 5xx / 仓库临时不可达）时，沿用上一轮该仓库的数据，避免总量被悄悄削掉。
-- **5 套配色主题**，输出 github-readme-stats 风格卡片。
+- **5 套配色主题**，输出 github-readme-stats 风格卡片。卡片宽度自适应：语言名列按实际文字宽度测量（不再写死），超长名才会用省略号截断，长名如 `Jupyter Notebook` 不会被色条盖住。
 
 ## 安装
 
@@ -52,22 +52,24 @@ python3 generate-lang-stats.py --svg-only -T tokyonight -n 15 -o out.svg
 python3 generate-lang-stats.py --history
 ```
 
-| 参数 | 说明 |
-| :--- | :--- |
-| `-t, --token` | GitHub token；不传则读 `GITHUB_TOKEN` |
-| `-u, --username` | 目标账号，默认 `Haoke98` |
-| `--db PATH` | SQLite 路径，默认脚本同目录 `lang-stats.db` |
-| `--cache PATH` | 缓存 JSON 路径，默认脚本同目录 `lang-cache.json` |
-| `-o, --output` | SVG 输出路径 |
-| `-T, --theme` | `dark` / `merko` / `tokyonight` / `onedark` / `nord` |
-| `-n, --top` | 卡片显示前 N 种语言，默认 20 |
-| `--svg` | 抓取后立即出图 |
-| `--svg-only` | 不抓取，用库里最新一轮出图 |
-| `--history` | 打印最近 5 轮快照 |
-| `--no-cache` | 忽略缓存，强制重抓 |
-| `--cache-ttl MIN` | 缓存有效期（分钟），默认 30；`0` 等于 `--no-cache` |
-| `--reuse-missing` | 抓不到的仓库沿用上一轮数据 |
-| `--save-json` | 额外导出最新聚合数据为 JSON |
+| 参数 | 默认值 | 说明 |
+| :--- | :--- | :--- |
+| `-t, --token` | 无（回退到 `GITHUB_TOKEN`） | GitHub token |
+| `-u, --username` | `Haoke98` | 目标账号 |
+| `--db PATH` | 脚本同目录 `lang-stats.db` | SQLite 数据库路径 |
+| `--cache PATH` | 脚本同目录 `lang-cache.json` | 接口缓存路径 |
+| `-o, --output` | 脚本同目录 `lang-stats.svg` | SVG 输出路径 |
+| `-T, --theme` | `merko` | `dark` / `merko` / `tokyonight` / `onedark` / `nord` |
+| `-n, --top` | `20` | 卡片显示前 N 种语言 |
+| `--svg` | 关 | 抓取后立即出图 |
+| `--svg-only` | 关 | 不抓取，用库里最新一轮出图 |
+| `--history` | 关 | 打印最近 5 轮快照 |
+| `--no-cache` | 关 | 忽略缓存，强制重抓 |
+| `--cache-ttl MIN` | `30` | 缓存有效期（分钟）；`0` 等于 `--no-cache` |
+| `--reuse-missing` | 关 | 抓不到的仓库沿用上一轮数据 |
+| `--save-json PATH` | 关 | 额外导出最新聚合数据为 JSON |
+| `-h, --help` | — | 打印帮助 |
+| `--version` | — | 打印版本号并退出 |
 
 ## 数据文件
 

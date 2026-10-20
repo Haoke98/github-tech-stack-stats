@@ -35,6 +35,7 @@ Usage:
 
 import argparse
 import json
+import math
 import os
 import sqlite3
 import sys
@@ -54,7 +55,7 @@ SVG_PATH = os.path.join(SCRIPT_DIR, "lang-stats.svg")
 # ── Config ────────────────────────────────────────────────────────
 DEFAULT_USERNAME = "Haoke98"
 DEFAULT_THEME = "merko"
-SCRIPT_VERSION = "3.2"
+SCRIPT_VERSION = "3.3"
 CACHE_TTL_MINUTES = 30
 CACHE_EMPTY_TTL_MINUTES = 360   # "this repo has no code" stays valid for 6h
 MAX_RETRIES = 3
@@ -660,19 +661,65 @@ def format_bytes(b):
     return f"{b} B"
 
 
+# Card geometry. The label column is measured, never assumed: a hardcoded 80px
+# column silently clipped "Jupyter Notebook" (17 chars ≈ 126px at 12px
+# monospace), and because the bar track is painted after the text the tail
+# simply disappeared under it.
+PADDING_X = 16
+PADDING_Y = 12
+HEADER_HEIGHT = 60
+ROW_HEIGHT = 24
+LABEL_FONT = 12
+VALUE_FONT = 10
+LABEL_GAP = 8
+LABEL_MIN = 60
+LABEL_MAX = 152
+RIGHT_RESERVE = 104         # "100.0%  999.9 MB" at VALUE_FONT + margin
+MIN_BAR_WIDTH = 110
+MIN_CARD_WIDTH = 360
+MONO_ADVANCE_RATIO = 0.62   # advance per font-size unit of the monospace stack
+ELLIPSIS = "…"
+
+
+def text_width(text, font_size):
+    """Width estimate for 'JetBrains Mono', 'Fira Code', 'Consolas', monospace."""
+    return len(text) * font_size * MONO_ADVANCE_RATIO
+
+
+def fit_label(label, font_size=LABEL_FONT, max_px=LABEL_MAX):
+    """Trim with an ellipsis only when a name cannot fit the widest column."""
+    if text_width(label, font_size) <= max_px:
+        return label
+    per_char = font_size * MONO_ADVANCE_RATIO
+    keep = max(1, int((max_px - text_width(ELLIPSIS, font_size)) // per_char))
+    return label[:keep].rstrip() + ELLIPSIS
+
+
+def svg_layout(labels):
+    """Return (card_width, label_w, bar_x, bar_width).
+
+    Guarantees the label column stops before the track starts, and that the
+    value column has its own reserved space so it never sits on the track.
+    """
+    longest = max((text_width(l, LABEL_FONT) for l in labels), default=0)
+    label_w = int(min(LABEL_MAX, max(LABEL_MIN, math.ceil(longest))))
+    card_width = max(
+        MIN_CARD_WIDTH,
+        math.ceil(PADDING_X * 2 + label_w + LABEL_GAP + MIN_BAR_WIDTH + RIGHT_RESERVE),
+    )
+    bar_x = PADDING_X + label_w + LABEL_GAP
+    bar_w = card_width - PADDING_X - RIGHT_RESERVE - bar_x
+    return card_width, label_w, bar_x, bar_w
+
+
 def generate_svg(languages, username, theme_name, output_path, top_n=20):
     theme = THEMES.get(theme_name, THEMES["merko"])
-    card_width = 360
-    row_height = 24
-    header_height = 60
-    padding_x = 16
-    padding_y = 12
-    content_rows = min(len(languages), top_n)
-    card_height = header_height + content_rows * row_height + padding_y * 2
-    total_bytes = sum(b for _, b in languages[:top_n])
-
-    bar_usable_width = card_width - padding_x * 2 - 90
-    text_x = padding_x + 80
+    shown = languages[:top_n]
+    content_rows = len(shown)
+    labels = [fit_label(lang) for lang, _ in shown]
+    card_width, label_w, bar_x, bar_w = svg_layout(labels)
+    card_height = HEADER_HEIGHT + content_rows * ROW_HEIGHT + PADDING_Y * 2
+    shown_bytes = sum(b for _, b in shown)
 
     parts = [f'''<?xml version="1.0" encoding="UTF-8"?>
 <svg width="{card_width}" height="{card_height}" viewBox="0 0 {card_width} {card_height}"
@@ -683,30 +730,29 @@ def generate_svg(languages, username, theme_name, output_path, top_n=20):
   <rect x="0" y="0" width="{card_width}" height="{card_height}" rx="6" fill="{theme['bg']}"/>
   <rect x="0" y="0" width="{card_width}" height="{card_height}" rx="6"
         fill="none" stroke="{theme['border']}" stroke-width="1"/>
-  <text x="{padding_x}" y="30" fill="{theme['title']}" font-size="14" font-weight="700">
+  <text x="{PADDING_X}" y="30" fill="{theme['title']}" font-size="14" font-weight="700">
     Top Languages
   </text>
-  <text x="{padding_x}" y="50" fill="{theme['text']}" font-size="11" opacity="0.6">
+  <text x="{PADDING_X}" y="50" fill="{theme['text']}" font-size="11" opacity="0.6">
     Public + Private repos
   </text>
 ''']
 
-    for idx, (lang, b) in enumerate(languages[:top_n]):
-        y = header_height + idx * row_height
-        pct = b / total_bytes * 100 if total_bytes > 0 else 0
+    value_x = card_width - PADDING_X
+    for idx, ((lang, b), label) in enumerate(zip(shown, labels)):
+        y = HEADER_HEIGHT + idx * ROW_HEIGHT
+        pct = b / shown_bytes * 100 if shown_bytes > 0 else 0
         color = theme["bar_colors"][idx % len(theme["bar_colors"])]
-        fill_w = max(0, int(bar_usable_width * (pct / 100)))
+        fill_w = max(0, int(round(bar_w * (pct / 100))))
 
         parts.append(f'''
-  <text x="{padding_x}" y="{y+16}" fill="{theme['text']}" font-size="12"
-        dominant-baseline="middle">{xml_escape(lang)}</text>
-  <rect x="{text_x}" y="{y+6}" width="{bar_usable_width}" height="10" rx="5"
+  <text x="{PADDING_X}" y="{y+16}" fill="{theme['text']}" font-size="{LABEL_FONT}"
+        dominant-baseline="middle">{xml_escape(label)}</text>
+  <rect x="{bar_x}" y="{y+6}" width="{bar_w}" height="10" rx="5"
         fill="{theme['bar_bg']}"/>
-  <rect x="{text_x}" y="{y+6}" width="{fill_w}" height="10" rx="5" fill="{color}"/>
-  <text x="{card_width-padding_x}" y="{y+16}" fill="{theme['text']}" font-size="10"
-        text-anchor="end" dominant-baseline="middle" opacity="0.8">
-    {pct:.1f}%  {format_bytes(b)}
-  </text>
+  <rect x="{bar_x}" y="{y+6}" width="{fill_w}" height="10" rx="5" fill="{color}"/>
+  <text x="{value_x}" y="{y+16}" fill="{theme['text']}" font-size="{VALUE_FONT}"
+        text-anchor="end" dominant-baseline="middle" opacity="0.8">{pct:.1f}%  {format_bytes(b)}</text>
 ''')
 
     parts.append('\n</svg>')
@@ -714,11 +760,16 @@ def generate_svg(languages, username, theme_name, output_path, top_n=20):
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("".join(parts))
 
+    trimmed = sum(1 for (lang, _), label in zip(shown, labels) if label != lang)
     full_bytes = sum(b for _, b in languages)
     print(f"✅ SVG saved to: {output_path}", file=sys.stderr)
     print(f"   {content_rows} of {len(languages)} languages shown "
-          f"({format_bytes(total_bytes)} of {format_bytes(full_bytes)} total)",
+          f"({format_bytes(shown_bytes)} of {format_bytes(full_bytes)} total), "
+          f"{card_width}px wide, label column {label_w}px",
           file=sys.stderr)
+    if trimmed:
+        print(f"   ⚠️  {trimmed} name(s) shortened with an ellipsis to fit the column",
+              file=sys.stderr)
 
 
 # ── Main ──────────────────────────────────────────────────────────
