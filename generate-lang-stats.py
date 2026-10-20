@@ -54,8 +54,9 @@ SVG_PATH = os.path.join(SCRIPT_DIR, "lang-stats.svg")
 # ── Config ────────────────────────────────────────────────────────
 DEFAULT_USERNAME = "Haoke98"
 DEFAULT_THEME = "merko"
-SCRIPT_VERSION = "3.1"
+SCRIPT_VERSION = "3.2"
 CACHE_TTL_MINUTES = 30
+CACHE_EMPTY_TTL_MINUTES = 360   # "this repo has no code" stays valid for 6h
 MAX_RETRIES = 3
 BASE_BACKOFF = 2
 
@@ -360,15 +361,51 @@ def cache_is_fresh(entry, ttl_minutes=CACHE_TTL_MINUTES):
         return False
 
 
-def cache_get(cache, repo_name, ttl_minutes=CACHE_TTL_MINUTES):
+def cache_lookup(cache, repo_name, ttl_minutes=CACHE_TTL_MINUTES):
+    """Return (hit, langs).
+
+    hit=True with langs={} means "we know this repo has no language data" —
+    a negative cache entry, valid far longer than a normal one. Without it,
+    every empty/451 repo is re-requested on every single run.
+    """
     entry = cache.get(repo_name)
-    if entry and cache_is_fresh(entry, ttl_minutes):
-        return {k: v for k, v in entry.items() if k != "_ts"}
-    return None
+    if not entry:
+        return False, None
+    if entry.get("_empty"):
+        effective = max(ttl_minutes, CACHE_EMPTY_TTL_MINUTES)
+        return (True, {}) if cache_is_fresh(entry, effective) else (False, None)
+    if not cache_is_fresh(entry, ttl_minutes):
+        return False, None
+    return True, {k: v for k, v in entry.items() if not k.startswith("_")}
 
 
 def cache_put(cache, repo_name, data):
     cache[repo_name] = {"_ts": datetime.now(timezone.utc).isoformat(), **data}
+
+
+def cache_put_empty(cache, repo_name):
+    cache[repo_name] = {"_ts": datetime.now(timezone.utc).isoformat(), "_empty": True}
+
+
+def cache_summary(cache, ttl_minutes):
+    """(entries, fresh, empties, oldest_age_in_minutes) for the startup banner."""
+    now = datetime.now(timezone.utc)
+    fresh = empties = 0
+    oldest = None
+    for entry in cache.values():
+        try:
+            age = now - datetime.fromisoformat(entry.get("_ts", ""))
+        except (ValueError, TypeError):
+            continue
+        if oldest is None or age > oldest:
+            oldest = age
+        if entry.get("_empty"):
+            empties += 1
+            if cache_is_fresh(entry, max(ttl_minutes, CACHE_EMPTY_TTL_MINUTES)):
+                fresh += 1
+        elif cache_is_fresh(entry, ttl_minutes):
+            fresh += 1
+    return len(cache), fresh, empties, (oldest.total_seconds() / 60 if oldest else None)
 
 
 # ── API client ────────────────────────────────────────────────────
@@ -453,10 +490,39 @@ def latest_repo_languages(conn, repo_name, before_run_id):
     return (langs or None), row[0]
 
 
-def collect_and_store(username, token, cache, no_cache, reuse_missing=False):
-    """Fetch all data, store in DB and cache. Returns (run_id, languages_list, totals)."""
+def latest_run_id(conn, username):
+    row = conn.execute("SELECT MAX(id) FROM runs WHERE username = ?",
+                       (username,)).fetchone()
+    return row[0] if row and row[0] is not None else None
+
+
+def run_repo_names(conn, run_id):
+    if run_id is None:
+        return set()
+    return {r[0] for r in conn.execute(
+        "SELECT DISTINCT repo_name FROM repo_languages WHERE run_id = ?", (run_id,))}
+
+
+def collect_and_store(username, token, cache, no_cache, reuse_missing=False,
+                      cache_ttl=None):
+    """Fetch data and persist one run. Returns (run_id, languages_list, totals).
+
+    Cache decisions depend only on entry age vs TTL — never on rendering
+    options (theme, --top, --output). A run that made no API call and sees the
+    same repo set as the previous one writes no DB row, so re-rendering the
+    card cannot pollute the history.
+    """
     conn = init_db()
-    ttl = CACHE_TTL_MINUTES if not no_cache else 0
+    ttl = 0 if no_cache else (CACHE_TTL_MINUTES if cache_ttl is None else cache_ttl)
+
+    if ttl <= 0:
+        print("🗃️  Cache: disabled — every repo will be fetched.", file=sys.stderr)
+    else:
+        entries, fresh, empties, oldest = cache_summary(cache, ttl)
+        age_txt = f", oldest {oldest:.0f} min" if oldest is not None else ""
+        empty_txt = f", {empties} known-empty" if empties else ""
+        print(f"🗃️  Cache: {entries} entries, {fresh} fresh "
+              f"(TTL {ttl} min{age_txt}{empty_txt})", file=sys.stderr)
 
     # 1. Fetch repos
     repos = fetch_all_repos(username, token)
@@ -469,60 +535,64 @@ def collect_and_store(username, token, cache, no_cache, reuse_missing=False):
     private = sum(1 for r in repos if r.get("private", False))
     print(f"   → {public} public, {private} private\n", file=sys.stderr)
 
-    # 2. Walk repos
+    # 2. Walk repos; buffer the run in memory so a crash leaves no half-written run
     totals = defaultdict(int)
     total_repos = len(repos)
-    cached_hits = 0
-    skipped = 0
-    reused = 0
-    total_stars = 0
-    total_forks = 0
-    total_open_issues = 0
-
-    # Save run first (we'll update counts later)
-    run_id = save_run(conn, username, total_repos, public, private, 0, 0)
+    collected = {}          # repo_name -> {language: bytes}
+    metadata = []           # repo dicts, written only when a run is persisted
+    cached_hits = empty_hits = api_calls = skipped = reused = 0
+    total_stars = total_forks = total_open_issues = 0
+    base_run_id = latest_run_id(conn, username) or 0
 
     for i, repo in enumerate(repos):
         name = repo["name"]
         owner = repo["owner"]["login"]
 
-        # Save metadata (stars/forks/issues/etc.) for EVERY repo
-        save_repo_metadata(conn, run_id, repo)
+        metadata.append(repo)
         total_stars += repo.get("stargazers_count", 0) or 0
         total_forks += repo.get("forks_count", 0) or 0
         total_open_issues += repo.get("open_issues_count", 0) or 0
 
-        # Check cache
-        cached = cache_get(cache, name, ttl) if ttl > 0 else None
-        if cached:
-            print(f"📊 [{i+1}/{total_repos}] {name} ← cache hit (+{len(cached)} langs)", file=sys.stderr)
-            save_repo_languages(conn, run_id, name, cached)
-            for lang, b in cached.items():
-                totals[lang] += b
-            cached_hits += 1
+        hit, cached = cache_lookup(cache, name, ttl) if ttl > 0 else (False, None)
+        if hit:
+            if cached:
+                collected[name] = cached
+                for lang, b in cached.items():
+                    totals[lang] += b
+                cached_hits += 1
+                print(f"📊 [{i+1}/{total_repos}] {name} ← cache hit "
+                      f"(+{len(cached)} langs)", file=sys.stderr)
+            else:
+                empty_hits += 1
+                print(f"📊 [{i+1}/{total_repos}] {name} ← cache hit "
+                      f"(known empty, 0 langs)", file=sys.stderr)
             continue
 
         # Fetch from API
         print(f"📊 [{i+1}/{total_repos}] {name}...", file=sys.stderr)
+        api_calls += 1
         langs = fetch_repo_languages(owner, name, token)
 
         if not langs:
             if reuse_missing:
-                prev, prev_run = latest_repo_languages(conn, name, run_id)
+                prev, prev_run = latest_repo_languages(conn, name, base_run_id + 1)
                 if prev:
                     print(f"↩ [{i+1}/{total_repos}] {name} — API returned nothing, "
                           f"reusing run {prev_run} ({len(prev)} langs)", file=sys.stderr)
-                    save_repo_languages(conn, run_id, name, prev)
+                    collected[name] = prev
                     for lang, b in prev.items():
                         totals[lang] += b
                     reused += 1
                     continue
+            if ttl > 0:
+                cache_put_empty(cache, name)
+                save_cache(cache)
             skipped += 1
         else:
             if ttl > 0:
                 cache_put(cache, name, langs)
                 save_cache(cache)
-            save_repo_languages(conn, run_id, name, langs)
+            collected[name] = langs
             for lang, b in langs.items():
                 totals[lang] += b
 
@@ -532,18 +602,34 @@ def collect_and_store(username, token, cache, no_cache, reuse_missing=False):
     sorted_langs = sorted(totals.items(), key=lambda x: x[1], reverse=True)
     total_bytes = sum(b for _, b in sorted_langs)
 
-    # Update run with totals
-    conn.execute(
-        "UPDATE runs SET total_bytes=?, language_count=?, "
-        "total_stars=?, total_forks=?, total_issues=? WHERE id=?",
-        (total_bytes, len(sorted_langs), total_stars, total_forks, total_open_issues, run_id),
-    )
-    save_language_stats(conn, run_id, sorted_langs)
-    conn.commit()
+    # 3. Persist only if something new was measured or the repo set moved
+    same_repo_set = bool(base_run_id) and run_repo_names(conn, base_run_id) == set(collected)
+    if api_calls == 0 and same_repo_set:
+        run_id = base_run_id
+        print(f"\n🗃️  0 API calls, repo set unchanged → no new run written; "
+              f"reusing run {run_id}", file=sys.stderr)
+    else:
+        run_id = save_run(conn, username, total_repos, public, private, 0, 0)
+        for name, langs in collected.items():
+            save_repo_languages(conn, run_id, name, langs)
+        for repo in metadata:
+            save_repo_metadata(conn, run_id, repo)
+        conn.execute(
+            "UPDATE runs SET total_bytes=?, language_count=?, "
+            "total_stars=?, total_forks=?, total_issues=? WHERE id=?",
+            (total_bytes, len(sorted_langs), total_stars, total_forks,
+             total_open_issues, run_id),
+        )
+        save_language_stats(conn, run_id, sorted_langs)
+        conn.commit()
 
     print(f"\n📊 Summary:", file=sys.stderr)
     print(f"   Repos processed: {total_repos - skipped}/{total_repos}", file=sys.stderr)
-    print(f"   Cache hits:      {cached_hits}", file=sys.stderr)
+    print(f"   API calls:       {api_calls}", file=sys.stderr)
+    hits_txt = f"{cached_hits} cached"
+    if empty_hits:
+        hits_txt += f", {empty_hits} known-empty"
+    print(f"   Cache hits:      {hits_txt}", file=sys.stderr)
     if reused:
         print(f"   Reused history:  {reused}", file=sys.stderr)
     print(f"   Skipped:         {skipped}", file=sys.stderr)
@@ -628,8 +714,11 @@ def generate_svg(languages, username, theme_name, output_path, top_n=20):
     with open(output_path, "w", encoding="utf-8") as f:
         f.write("".join(parts))
 
+    full_bytes = sum(b for _, b in languages)
     print(f"✅ SVG saved to: {output_path}", file=sys.stderr)
-    print(f"   {content_rows} languages shown, {format_bytes(total_bytes)} total", file=sys.stderr)
+    print(f"   {content_rows} of {len(languages)} languages shown "
+          f"({format_bytes(total_bytes)} of {format_bytes(full_bytes)} total)",
+          file=sys.stderr)
 
 
 # ── Main ──────────────────────────────────────────────────────────
@@ -650,6 +739,9 @@ def main():
     parser.add_argument("-n", "--top", type=int, default=20)
     parser.add_argument("-o", "--output", default=SVG_PATH, help="SVG output path")
     parser.add_argument("--no-cache", action="store_true", help="Skip API cache")
+    parser.add_argument("--cache-ttl", type=int, default=CACHE_TTL_MINUTES, metavar="MIN",
+                        help="Reuse per-repo data younger than MIN minutes "
+                             f"(default: {CACHE_TTL_MINUTES}, 0 = always refetch)")
     parser.add_argument("--reuse-missing", action="store_true",
                         help="If a repo's language call returns nothing, reuse its "
                              "data from the previous run instead of dropping it")
@@ -710,6 +802,7 @@ def main():
 
     print(f"🔍 GitHub user:  {args.username}", file=sys.stderr)
     print(f"📁 DB:           {DB_PATH}", file=sys.stderr)
+    print(f"🗃️  Cache:        {CACHE_PATH}", file=sys.stderr)
     print(f"🎨 Theme:        {args.theme}", file=sys.stderr)
     if args.svg:
         print(f"🖼️  SVG output:   {args.output}", file=sys.stderr)
@@ -718,6 +811,7 @@ def main():
     cache = load_cache()
     run_id, languages, total_bytes = collect_and_store(
         args.username, token, cache, args.no_cache, args.reuse_missing,
+        cache_ttl=args.cache_ttl,
     )
 
     if args.svg:
