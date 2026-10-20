@@ -1,0 +1,99 @@
+# github-tech-stack-stats
+
+抓取 GitHub 账号下**全部仓库（含私有）**的语言字节分布，存成带**多轮历史**的本地 SQLite，并生成一张 Top Languages 统计卡片（SVG）。
+
+单文件脚本，只依赖 Python 3.9+ 标准库，无第三方包、无需虚拟环境。
+
+<p align="center">
+  <img alt="Top Languages" src="https://raw.githubusercontent.com/Haoke98/Haoke98/main/lang-stats.svg" width="420"/>
+</p>
+
+> 上面这张卡片由本脚本生成，产物提交在个人主页仓库 `Haoke98/Haoke98`，这里只放工具本身。
+
+## 特性
+
+- **全量统计**：公开 + 私有仓库逐一取 `/languages`，按字节汇总，不受 GitHub 自带语言条（只算公开仓库）的限制。
+- **多轮历史，只追加**：每跑一次写入一条 `runs` 快照（仓库数、总字节、语言数、⭐/🍴/📝 总数），外加每仓库明细与聚合 JSON。历史轮次永不覆盖。
+- **老库自动升级**：改了表结构不会让旧库炸掉。启动时比对 `PRAGMA table_info`，缺列就 `ALTER TABLE ADD COLUMN`（纯追加），**升级前自动生成 `lang-stats.db.bak-migration-<时间戳>` 快照**。
+- **断点续跑**：每仓库语言数据缓存 30 分钟，中断后重跑不会从头再抓。
+- **`--reuse-missing`**：某仓库语言接口返回空（限流 / 瞬时 5xx / 仓库临时不可达）时，沿用上一轮该仓库的数据，避免总量被悄悄削掉。
+- **5 套配色主题**，输出 github-readme-stats 风格卡片。
+
+## 安装
+
+```bash
+git clone https://github.com/Haoke98/github-tech-stack-stats.git
+cd github-tech-stack-stats
+```
+
+需要一个 GitHub token（fine-grained 即可）：至少要 **Metadata: Read**（列仓库）+ **Contents: Read**（读私有仓库语言），勾选全部私有仓库。
+
+```bash
+export GITHUB_TOKEN=github_pat_xxx     # 别写进命令行，会留在 shell 历史里
+```
+
+## 用法
+
+```bash
+# 抓取并入库（只存数据，不出图）
+python3 generate-lang-stats.py
+
+# 抓取 + 出图，产物直接写进个人主页仓库
+python3 generate-lang-stats.py --svg -o ../Haoke98/lang-stats.svg
+
+# 用上一轮数据补齐本轮抓取失败的仓库
+python3 generate-lang-stats.py --reuse-missing --svg -o ../Haoke98/lang-stats.svg
+
+# 不联网，直接从库里最新一轮出图
+python3 generate-lang-stats.py --svg-only -T tokyonight -n 15 -o out.svg
+
+# 看历史轮次
+python3 generate-lang-stats.py --history
+```
+
+| 参数 | 说明 |
+| :--- | :--- |
+| `-t, --token` | GitHub token；不传则读 `GITHUB_TOKEN` |
+| `-u, --username` | 目标账号，默认 `Haoke98` |
+| `--db PATH` | SQLite 路径，默认脚本同目录 `lang-stats.db` |
+| `--cache PATH` | 缓存 JSON 路径，默认脚本同目录 `lang-cache.json` |
+| `-o, --output` | SVG 输出路径 |
+| `-T, --theme` | `dark` / `merko` / `tokyonight` / `onedark` / `nord` |
+| `-n, --top` | 卡片显示前 N 种语言，默认 20 |
+| `--svg` | 抓取后立即出图 |
+| `--svg-only` | 不抓取，用库里最新一轮出图 |
+| `--history` | 打印最近 5 轮快照 |
+| `--no-cache` | 忽略缓存，强制重抓 |
+| `--reuse-missing` | 抓不到的仓库沿用上一轮数据 |
+| `--save-json` | 额外导出最新聚合数据为 JSON |
+
+## 数据文件
+
+`lang-stats.db` 与 `lang-cache.json` 都在 `.gitignore` 里，**只留在本地**，不会进版本库。数据库可以放在任意位置（`--db`），工具与数据彻底解耦。
+
+## 数据库结构
+
+| 表 | 内容 |
+| :--- | :--- |
+| `runs` | 每轮一行：账号、时间、仓库数（公开/私有）、总字节、语言数、⭐/🍴/📝 总数 |
+| `repo_languages` | 每轮 × 每仓库 × 每语言：字节数 |
+| `repo_metadata` | 每轮 × 每仓库：stars/forks/issues/watchers/size/是否 fork/是否私有/时间戳 |
+| `language_stats` | 每轮的聚合结果（JSON，供 `--svg-only` 快速取用） |
+
+## 表结构升级策略
+
+改表结构时**不要**靠删库重跑——那样历史全丢。正确姿势：
+
+1. 在 `SCHEMA_UPGRADES` 里登记新列（纯追加，带 `DEFAULT`，旧行自动填默认值）；
+2. `init_db()` 启动时自动补齐缺列；
+3. 有 `repo_metadata` 明细的历史轮次，`backfill_run_totals()` 会把 ⭐/🍴/📝 汇总回填。
+
+如果某轮统计是在采集元数据之前跑的，它的 ⭐/🍴 会是 0——这是"当时没采"，不是数据丢失。
+
+## 测试
+
+```bash
+python3 -m unittest discover -s tests -v
+```
+
+覆盖：老库就地升级不丢行、升级幂等且只备份一次、元数据回填、空库建表、新轮次追加不动历史。

@@ -49,7 +49,7 @@ from xml.sax.saxutils import escape as xml_escape
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_PATH = os.path.join(SCRIPT_DIR, "lang-stats.db")
 CACHE_PATH = os.path.join(SCRIPT_DIR, "lang-cache.json")
-SVG_PATH = os.path.join(SCRIPT_DIR, "..", "lang-stats.svg")
+SVG_PATH = os.path.join(SCRIPT_DIR, "lang-stats.svg")
 
 # ── Config ────────────────────────────────────────────────────────
 DEFAULT_USERNAME = "Haoke98"
@@ -183,8 +183,11 @@ def backup_db(conn, reason="migration") -> str:
     """WAL-safe snapshot next to the DB; returns the backup path."""
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
     dst = f"{DB_PATH}.bak-{reason}-{stamp}"
-    with sqlite3.connect(dst) as bck:
+    bck = sqlite3.connect(dst)
+    try:
         conn.backup(bck)
+    finally:
+        bck.close()
     return dst
 
 
@@ -632,11 +635,17 @@ def generate_svg(languages, username, theme_name, output_path, top_n=20):
 # ── Main ──────────────────────────────────────────────────────────
 
 def main():
+    global DB_PATH, CACHE_PATH
+
     parser = argparse.ArgumentParser(
         description="GitHub language stats — fetch, store, visualize"
     )
     parser.add_argument("-t", "--token", help="GitHub token (or GITHUB_TOKEN env var)")
     parser.add_argument("-u", "--username", default=DEFAULT_USERNAME)
+    parser.add_argument("--db", default=DB_PATH,
+                        help="SQLite database path (default: next to this script)")
+    parser.add_argument("--cache", default=CACHE_PATH,
+                        help="API cache JSON path (default: next to this script)")
     parser.add_argument("-T", "--theme", default=DEFAULT_THEME, choices=list(THEMES.keys()))
     parser.add_argument("-n", "--top", type=int, default=20)
     parser.add_argument("-o", "--output", default=SVG_PATH, help="SVG output path")
@@ -651,8 +660,15 @@ def main():
     parser.add_argument("--history", action="store_true",
                         help="Show recent run history")
     parser.add_argument("--save-json", help="Also save latest stats as JSON")
+    parser.add_argument("--version", action="version",
+                        version=f"%(prog)s {SCRIPT_VERSION}")
 
     args = parser.parse_args()
+
+    # Resolve data locations early: the tool may live anywhere, the data may
+    # live elsewhere (~/data, a synced folder, another checkout).
+    DB_PATH = os.path.abspath(os.path.expanduser(args.db))
+    CACHE_PATH = os.path.abspath(os.path.expanduser(args.cache))
 
     # ── History mode ──
     if args.history:
