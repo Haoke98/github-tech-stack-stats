@@ -55,7 +55,7 @@ SVG_PATH = os.path.join(SCRIPT_DIR, "lang-stats.svg")
 # ── Config ────────────────────────────────────────────────────────
 DEFAULT_USERNAME = "Haoke98"
 DEFAULT_THEME = "merko"
-SCRIPT_VERSION = "3.3"
+SCRIPT_VERSION = "3.4"
 CACHE_TTL_MINUTES = 30
 CACHE_EMPTY_TTL_MINUTES = 360   # "this repo has no code" stays valid for 6h
 MAX_RETRIES = 3
@@ -247,9 +247,10 @@ def init_db() -> sqlite3.Connection:
 
 
 def save_run(conn, username, total_repos, public_repos, private_repos,
-             total_bytes, lang_count, total_stars=0, total_forks=0, total_issues=0):
+             total_bytes, lang_count, total_stars=0, total_forks=0, total_issues=0,
+             timestamp=None):
     """Insert a new run and return its ID."""
-    ts = datetime.now(timezone.utc).isoformat()
+    ts = timestamp or datetime.now(timezone.utc).isoformat()
     cur = conn.execute(
         "INSERT INTO runs (username, timestamp, total_repos, public_repos, "
         "private_repos, total_bytes, language_count, total_stars, total_forks, total_issues) "
@@ -497,6 +498,13 @@ def latest_run_id(conn, username):
     return row[0] if row and row[0] is not None else None
 
 
+def run_timestamp(conn, run_id):
+    if run_id is None:
+        return None
+    row = conn.execute("SELECT timestamp FROM runs WHERE id = ?", (run_id,)).fetchone()
+    return row[0] if row else None
+
+
 def run_repo_names(conn, run_id):
     if run_id is None:
         return set()
@@ -604,13 +612,16 @@ def collect_and_store(username, token, cache, no_cache, reuse_missing=False,
     total_bytes = sum(b for _, b in sorted_langs)
 
     # 3. Persist only if something new was measured or the repo set moved
+    run_ts = datetime.now(timezone.utc).isoformat()
     same_repo_set = bool(base_run_id) and run_repo_names(conn, base_run_id) == set(collected)
     if api_calls == 0 and same_repo_set:
         run_id = base_run_id
+        run_ts = run_timestamp(conn, run_id) or run_ts
         print(f"\n🗃️  0 API calls, repo set unchanged → no new run written; "
               f"reusing run {run_id}", file=sys.stderr)
     else:
-        run_id = save_run(conn, username, total_repos, public, private, 0, 0)
+        run_id = save_run(conn, username, total_repos, public, private, 0, 0,
+                          timestamp=run_ts)
         for name, langs in collected.items():
             save_repo_languages(conn, run_id, name, langs)
         for repo in metadata:
@@ -640,6 +651,7 @@ def collect_and_store(username, token, cache, no_cache, reuse_missing=False,
     print(f"   Languages:       {len(sorted_langs)}", file=sys.stderr)
     print(f"   Total code:      {format_bytes(total_bytes)}", file=sys.stderr)
     print(f"   Run ID:          {run_id}", file=sys.stderr)
+    print(f"   Collected at:    {format_collected_at(run_ts)[0]}", file=sys.stderr)
 
     # Print top 10
     print(f"\n📊 Top languages:", file=sys.stderr)
@@ -648,7 +660,7 @@ def collect_and_store(username, token, cache, no_cache, reuse_missing=False,
         print(f"   {lang:20s} {format_bytes(b):>10s}  ({pct:5.1f}%)", file=sys.stderr)
 
     conn.close()
-    return run_id, sorted_langs, total_bytes
+    return run_id, sorted_langs, total_bytes, run_ts
 
 
 # ── SVG generation ────────────────────────────────────────────────
@@ -679,6 +691,28 @@ MIN_BAR_WIDTH = 110
 MIN_CARD_WIDTH = 360
 MONO_ADVANCE_RATIO = 0.62   # advance per font-size unit of the monospace stack
 ELLIPSIS = "…"
+FOOTER_HEIGHT = 22          # watermark band under the last row
+FOOTER_FONT = 9
+
+
+def format_collected_at(timestamp):
+    """Return (pretty, iso) for the run's collection time.
+
+    The card can be rendered anywhere, so the zone is written explicitly
+    ("UTC+08") instead of relying on the viewer's locale.
+    """
+    try:
+        dt = datetime.fromisoformat(timestamp)
+    except (TypeError, ValueError):
+        return str(timestamp), str(timestamp)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    local = dt.astimezone()
+    minutes = int((local.utcoffset() or timedelta(0)).total_seconds() // 60)
+    sign = "+" if minutes >= 0 else "-"
+    hours, mins = divmod(abs(minutes), 60)
+    zone = f"UTC{sign}{hours:02d}" + (f":{mins:02d}" if mins else "")
+    return f"{local.strftime('%Y-%m-%d %H:%M')} {zone}", dt.isoformat()
 
 
 def text_width(text, font_size):
@@ -712,13 +746,21 @@ def svg_layout(labels):
     return card_width, label_w, bar_x, bar_w
 
 
-def generate_svg(languages, username, theme_name, output_path, top_n=20):
+def generate_svg(languages, username, theme_name, output_path, top_n=20,
+                 collected_at=None, show_timestamp=True):
     theme = THEMES.get(theme_name, THEMES["merko"])
     shown = languages[:top_n]
     content_rows = len(shown)
     labels = [fit_label(lang) for lang, _ in shown]
     card_width, label_w, bar_x, bar_w = svg_layout(labels)
-    card_height = HEADER_HEIGHT + content_rows * ROW_HEIGHT + PADDING_Y * 2
+
+    footer = iso = ""
+    if show_timestamp and collected_at:
+        pretty, iso = format_collected_at(collected_at)
+        footer = f"Data collected {pretty}"
+
+    card_height = (HEADER_HEIGHT + content_rows * ROW_HEIGHT + PADDING_Y * 2
+                   + (FOOTER_HEIGHT if footer else 0))
     shown_bytes = sum(b for _, b in shown)
 
     parts = [f'''<?xml version="1.0" encoding="UTF-8"?>
@@ -754,6 +796,14 @@ def generate_svg(languages, username, theme_name, output_path, top_n=20):
   <text x="{value_x}" y="{y+16}" fill="{theme['text']}" font-size="{VALUE_FONT}"
         text-anchor="end" dominant-baseline="middle" opacity="0.8">{pct:.1f}%  {format_bytes(b)}</text>
 ''')
+
+    if footer:
+        parts.append(
+            f'\n  <text x="{card_width / 2:.1f}" y="{card_height - FOOTER_HEIGHT / 2:.1f}" '
+            f'fill="{theme["text"]}" font-size="{FOOTER_FONT}" text-anchor="middle" '
+            f'dominant-baseline="middle" opacity="0.45">'
+            f'<title>Data collected {xml_escape(iso)}</title>'
+            f'{xml_escape(footer)}</text>')
 
     parts.append('\n</svg>')
 
@@ -802,6 +852,8 @@ def main():
                         help="Generate SVG from latest DB data (no API calls)")
     parser.add_argument("--history", action="store_true",
                         help="Show recent run history")
+    parser.add_argument("--no-timestamp", action="store_true",
+                        help="Omit the collection-time watermark at the bottom of the card")
     parser.add_argument("--save-json", help="Also save latest stats as JSON")
     parser.add_argument("--version", action="version",
                         version=f"%(prog)s {SCRIPT_VERSION}")
@@ -838,7 +890,8 @@ def main():
             print("❌ No data in DB. Run with --token first.", file=sys.stderr)
             sys.exit(1)
         print(f"📅 Using stats from: {ts}", file=sys.stderr)
-        generate_svg(langs, args.username, args.theme, args.output, args.top)
+        generate_svg(langs, args.username, args.theme, args.output, args.top,
+                     collected_at=ts, show_timestamp=not args.no_timestamp)
         if args.save_json:
             with open(args.save_json, "w") as f:
                 json.dump({l: b for l, b in langs}, f, indent=2)
@@ -860,14 +913,16 @@ def main():
     print("", file=sys.stderr)
 
     cache = load_cache()
-    run_id, languages, total_bytes = collect_and_store(
+    run_id, languages, total_bytes, collected_at = collect_and_store(
         args.username, token, cache, args.no_cache, args.reuse_missing,
         cache_ttl=args.cache_ttl,
     )
 
     if args.svg:
         print("", file=sys.stderr)
-        generate_svg(languages, args.username, args.theme, args.output, args.top)
+        generate_svg(languages, args.username, args.theme, args.output, args.top,
+                     collected_at=collected_at,
+                     show_timestamp=not args.no_timestamp)
 
     if args.save_json:
         with open(args.save_json, "w") as f:

@@ -81,14 +81,15 @@ class CachePolicyTest(unittest.TestCase):
     # ── tests ────────────────────────────────────────────────────
     def test_fresh_cache_makes_no_api_calls(self):
         cache = self.seed_cache(5)
-        (run_id, langs, total), _ = self.collect(cache)
+        (run_id, langs, total, collected_at), _ = self.collect(cache)
         self.assertEqual(self.calls, 0)
         self.assertEqual(dict(langs)["Python"], len(REPOS) * 1000)
         self.assertEqual(self.run_count(), 1)
+        self.assertTrue(collected_at and collected_at[:2] == "20")
 
     def test_expired_cache_refetches(self):
         cache = self.seed_cache(40)   # older than the 30-minute default TTL
-        (run_id, _, _), _ = self.collect(cache)
+        (run_id, _, _, _), _ = self.collect(cache)
         self.assertEqual(self.calls, len(REPOS), "expired entries must be refetched")
 
     def test_rerender_does_not_add_a_run(self):
@@ -98,6 +99,8 @@ class CachePolicyTest(unittest.TestCase):
         second, out = self.collect(cache)       # same data, no API call
         self.assertEqual(first[0], 1)
         self.assertEqual(second[0], 1, "run id must be reused, not a new row")
+        self.assertEqual(second[3], first[3],
+                         "reused run must keep its own collection timestamp")
         self.assertEqual(self.run_count(), 1)
         self.assertIn("no new run written", out)
 
@@ -132,13 +135,13 @@ class CachePolicyTest(unittest.TestCase):
 
     def test_cache_ttl_zero_disables_cache(self):
         cache = self.seed_cache(1)
-        (_, _, _), out = self.collect(cache, cache_ttl=0)
+        (_, _, _, _), out = self.collect(cache, cache_ttl=0)
         self.assertEqual(self.calls, len(REPOS))
         self.assertIn("Cache: disabled", out)
 
     def test_custom_ttl_can_be_shorter_than_entry_age(self):
         cache = self.seed_cache(10)
-        (_, _, _), _ = self.collect(cache, cache_ttl=5)   # 10 min old > 5 min TTL
+        (_, _, _, _), _ = self.collect(cache, cache_ttl=5)   # 10 min old > 5 min TTL
         self.assertEqual(self.calls, len(REPOS))
 
     def test_cache_summary_counts_fresh_and_empty(self):
